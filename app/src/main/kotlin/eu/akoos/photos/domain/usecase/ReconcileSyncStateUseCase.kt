@@ -84,6 +84,9 @@ class ReconcileSyncStateUseCase @Inject constructor(
         // file that merely shares a name (Drive allows that) can't be taken for a backup.
         val stripOnUpload = prefs[SettingsKeys.STRIP_ON_UPLOAD] ?: false
         val compressOnUpload = prefs[SettingsKeys.COMPRESS_ON_UPLOAD] ?: false
+        // Videos have their own compression switch; reading only the photo one left a compressed
+        // video unable to re-pair after a reinstall (its bytes no longer hash-match the original).
+        val compressVideosOnUpload = prefs[SettingsKeys.COMPRESS_VIDEO_ON_UPLOAD] ?: false
 
         val allLocalItems = localRepo.observeLocalMedia().first()
 
@@ -229,7 +232,8 @@ class ReconcileSyncStateUseCase @Inject constructor(
             // uploaded. (No name-only fallback either: a recurring camera name like IMG_0001.jpg must
             // never pair on its own.)
             val byNameUnverifiable = nameCandidate?.takeIf {
-                it.contentHash.isNullOrEmpty() || stripOnUpload || compressOnUpload
+                it.contentHash.isNullOrEmpty() ||
+                    uploadRewritesBytes(local.mimeType, stripOnUpload, compressOnUpload, compressVideosOnUpload)
             }
             // Last resort, downloads-only: re-pair to a still-present cloud twin by name + EXACT capture
             // second even when that twin HAS a hash. A download stamps the twin's own capture time into
@@ -474,6 +478,18 @@ class ReconcileSyncStateUseCase @Inject constructor(
         emit(SyncProgress(total, total, false))
     }
 }
+
+/**
+ * Whether the upload may have rewritten this file's bytes, so its cloud copy can't hash-match the
+ * local original and a name match has to be trusted. Photos and videos have separate compression switches.
+ */
+internal fun uploadRewritesBytes(
+    mimeType: String,
+    stripOnUpload: Boolean,
+    compressPhotosOnUpload: Boolean,
+    compressVideosOnUpload: Boolean,
+): Boolean = stripOnUpload ||
+    if (mimeType.startsWith("video/")) compressVideosOnUpload else compressPhotosOnUpload
 
 /**
  * Pure gate for reconcile's downloads-only name+date re-pair. Returns the cloud twin's linkId to
