@@ -293,9 +293,18 @@ data class UploadEvent(
     /** Live plaintext bytes processed for THIS file's current phase (encrypt or upload); 0
      *  outside those phases. Drives the per-photo progress bar in the Activity monitor. */
     val doneBytes: Long = 0L,
+    /** [UploadEventStatus.Compressing] only: see [eu.akoos.photos.domain.usecase.UploadProgress]. */
+    val compressFraction: Float = 0f,
+    val compressCodecMime: String? = null,
+    val compressSpeedX: Float? = null,
 )
 
-enum class UploadEventStatus { Uploading, Queued, Encrypting, Done, Failed }
+enum class UploadEventStatus {
+    Uploading, Queued, Compressing, Encrypting, Done, Failed;
+
+    /** Being compressed, encrypted or uploaded right now. */
+    val inFlight: Boolean get() = this == Uploading || this == Compressing || this == Encrypting
+}
 
 /**
  * Which Copy text model drawer the AI settings panel is showing, if any. [Download] asks to fetch the

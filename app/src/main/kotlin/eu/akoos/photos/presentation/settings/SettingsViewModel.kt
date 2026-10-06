@@ -657,6 +657,7 @@ class SettingsViewModel @Inject constructor(
                         else -> {
                             val uiStatus = when (evt.status) {
                                 UploadStatus.Uploading -> UploadEventStatus.Uploading
+                                UploadStatus.Compressing -> UploadEventStatus.Compressing
                                 UploadStatus.Encrypting -> UploadEventStatus.Encrypting
                                 UploadStatus.Done -> UploadEventStatus.Done
                                 UploadStatus.Failed -> UploadEventStatus.Failed
@@ -671,7 +672,8 @@ class SettingsViewModel @Inject constructor(
                             // signals the start of a new run. Wipe the stale events + bytes map
                             // so the panel doesn't merge two batches into one row list.
                             val firstPerFileStatus = evt.status == UploadStatus.Uploading ||
-                                evt.status == UploadStatus.Encrypting
+                                evt.status == UploadStatus.Encrypting ||
+                                evt.status == UploadStatus.Compressing
                             val isNewBatch = firstPerFileStatus &&
                                 current.uploadTotalCount > 0 &&
                                 current.uploadDoneCount >= current.uploadTotalCount
@@ -686,6 +688,9 @@ class SettingsViewModel @Inject constructor(
                                 displayName = evt.displayName,
                                 status = uiStatus,
                                 sizeBytes = evt.sizeBytes,
+                                compressFraction = evt.compressFraction,
+                                compressCodecMime = evt.compressCodecMime,
+                                compressSpeedX = evt.compressSpeedX,
                             )).takeLast(30)
 
                             // Start the batch timer on the FIRST per-file signal of the run

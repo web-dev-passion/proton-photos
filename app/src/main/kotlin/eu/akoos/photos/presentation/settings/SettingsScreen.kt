@@ -152,6 +152,7 @@ import eu.akoos.photos.util.sanitizeErrorMessage
 import eu.akoos.photos.presentation.settings.compression.CodecPicker
 import eu.akoos.photos.presentation.settings.compression.EstimateLine
 import eu.akoos.photos.presentation.settings.compression.PresetPicker
+import eu.akoos.photos.presentation.settings.compression.compressingLabel
 import eu.akoos.photos.presentation.settings.components.ActionRow
 import eu.akoos.photos.presentation.settings.components.AppLockTimeoutRow
 import eu.akoos.photos.presentation.settings.components.CollapsibleSection
@@ -2626,6 +2627,18 @@ private fun UploadEventRow(evt: UploadEvent) {
                     color = colors.accent,
                 )
             }
+            UploadEventStatus.Compressing -> Box(
+                // The transcode's progress is known, so the ring fills instead of spinning.
+                modifier = Modifier.size(18.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                CircularProgressIndicator(
+                    progress = { evt.compressFraction.coerceIn(0f, 1f) },
+                    modifier = Modifier.size(16.dp),
+                    strokeWidth = 1.8.dp,
+                    color = colors.fgDim,
+                )
+            }
             UploadEventStatus.Encrypting -> Box(
                 // Same spinner shape as Uploading but rendered in the dimmer fgDim tint -
                 // signals "pre-network work in progress" without competing visually with the
@@ -2703,6 +2716,8 @@ private fun UploadEventRow(evt: UploadEvent) {
         val (label, labelColor) = when (evt.status) {
             UploadEventStatus.Uploading -> stringResource(R.string.upload_status_uploading) to colors.accent
             UploadEventStatus.Encrypting -> stringResource(R.string.upload_status_encrypting) to colors.fgDim
+            UploadEventStatus.Compressing ->
+                compressingLabel(evt.compressFraction, evt.compressCodecMime, evt.compressSpeedX) to colors.fgDim
             UploadEventStatus.Queued -> stringResource(R.string.upload_status_queued) to colors.fgMute
             UploadEventStatus.Done -> stringResource(R.string.upload_status_done) to StatusSynced
             UploadEventStatus.Failed -> stringResource(R.string.upload_status_failed) to colors.errorColor

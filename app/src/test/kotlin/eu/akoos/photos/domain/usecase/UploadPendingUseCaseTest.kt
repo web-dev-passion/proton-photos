@@ -37,6 +37,7 @@ import io.mockk.slot
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.test.runTest
 import me.proton.core.domain.entity.UserId
@@ -44,10 +45,14 @@ import eu.akoos.photos.data.db.dao.UploadAlbumTargetDao
 import eu.akoos.photos.data.preferences.SettingsKeys
 import eu.akoos.photos.data.preferences.settingsDataStore
 import eu.akoos.photos.data.upload.UploadImageCompressor
+import eu.akoos.photos.data.upload.VideoUploadCompressor
 import eu.akoos.photos.data.upload.compression.VideoUploadCompression
 import eu.akoos.photos.domain.entity.compression.CompressionOutcome
 import eu.akoos.photos.domain.entity.compression.CompressionSkipReason
+import eu.akoos.photos.domain.entity.compression.HdrHandling
+import eu.akoos.photos.domain.entity.compression.VideoCodec
 import eu.akoos.photos.domain.entity.compression.VideoCodecChoice
+import eu.akoos.photos.domain.entity.compression.VideoCompressionPlan
 import eu.akoos.photos.domain.entity.compression.VideoCompressionProfile
 import eu.akoos.photos.domain.entity.LocalMediaItem
 import eu.akoos.photos.domain.entity.UploadCompressionTier
@@ -616,6 +621,52 @@ class UploadPendingUseCaseTest {
         coVerify(exactly = 5) { cloudRepo.uploadFile(userId, any(), any(), any(), any(), any()) }
     }
 
+    @Test
+    fun `a compressed video is queued around its transcode and then encrypts`() = runTest {
+        every { mockPrefsRef[SettingsKeys.COMPRESS_VIDEO_ON_UPLOAD] } returns true
+        every { syncStateRepo.observeAll(userId) } returns flowOf(listOf(syncState("uri://vid", SyncStatus.LOCAL_ONLY)))
+        every { localRepo.observeLocalMedia() } returns flowOf(listOf(videoItem("uri://vid")))
+        coEvery { localRepo.queryByUri("uri://vid") } returns videoItem("uri://vid")
+        coEvery { cloudRepo.uploadFile(userId, any(), any(), any(), any(), any()) } returns "cloud-id"
+        val temp = java.io.File.createTempFile("videocompress_", ".mp4").apply { writeBytes(ByteArray(10)) }
+        coEvery {
+            videoCompression.compress(any(), any(), any(), any(), any())
+        } coAnswers {
+            val onPlanned = arg<(VideoCompressionPlan.Transcode) -> Unit>(3)
+            val onProgress = arg<(VideoUploadCompressor.Progress) -> Unit>(4)
+            onPlanned(transcodePlan())
+            onProgress(VideoUploadCompressor.Progress(0.5f, VideoCodec.HEVC, 1.8f))
+            VideoUploadCompression.Attempt(temp, CompressionOutcome.COMPRESSED, null, 10_000_000L, "video/hevc", 10L)
+        }
+        val frames = mutableListOf<UploadProgress>()
+        val collector = launch { useCase.progress.collect { frames += it } }
+        // android.net.Uri is a stub on the JVM; the upload path turns the compressed temp into a
+        // file:// URI string, so hand back a real-looking one.
+        mockkStatic(Uri::class)
+        every { Uri.fromFile(any()) } answers {
+            mockk<Uri> { every { this@mockk.toString() } returns "file://" + firstArg<java.io.File>().path }
+        }
+
+        useCase(userId)
+        advanceUntilIdle()
+        collector.cancel()
+        io.mockk.unmockkStatic(Uri::class)
+
+        val statuses = frames.filter { it.uri == "uri://vid" }.map { it.status }
+            .fold(mutableListOf<UploadStatus>()) { acc, st -> if (acc.lastOrNull() != st) acc += st; acc }
+        assertEquals(
+            listOf(
+                UploadStatus.Encrypting, UploadStatus.Queued, UploadStatus.Compressing, UploadStatus.Queued,
+                UploadStatus.Encrypting, UploadStatus.Done,
+            ),
+            statuses,
+        )
+        val compressing = frames.filter { it.status == UploadStatus.Compressing }
+        assertEquals("video/hevc", compressing.last().compressCodecMime)
+        assertTrue(compressing.any { it.compressFraction == 0.5f && it.compressSpeedX == 1.8f })
+        temp.delete()
+    }
+
     private fun videoItem(uri: String) = LocalMediaItem(
         uri = uri,
         dateTaken = 1000L,
@@ -627,6 +678,11 @@ class UploadPendingUseCaseTest {
 
     private fun skippedAttempt() =
         VideoUploadCompression.Attempt(null, CompressionOutcome.SKIPPED, CompressionSkipReason.ALREADY_EFFICIENT)
+
+    private fun transcodePlan() = VideoCompressionPlan.Transcode(
+        codec = VideoCodec.HEVC, plannedFallback = null, hardware = true, scaleToShortSide = 0,
+        frameRateCap = null, hdr = HdrHandling.SDR_SOURCE, targetBitrate = 3_500_000,
+    )
 
     /**
      * Runs [block] with [ExifHelper]'s strip entry points stubbed to a clean no-op, unmocking on exit

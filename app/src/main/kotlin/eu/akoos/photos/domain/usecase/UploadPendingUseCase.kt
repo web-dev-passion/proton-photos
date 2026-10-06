@@ -53,6 +53,7 @@ import eu.akoos.photos.data.preferences.settingsDataStore
 import eu.akoos.photos.data.preferences.CompressionPreferences
 import eu.akoos.photos.data.upload.MirrorOverwriteJournal
 import eu.akoos.photos.data.upload.UploadImageCompressor
+import eu.akoos.photos.data.upload.VideoUploadCompressor
 import eu.akoos.photos.data.upload.compression.VideoUploadCompression
 import eu.akoos.photos.domain.entity.QueueSource
 import eu.akoos.photos.domain.entity.StorageFullException
@@ -125,7 +126,9 @@ private const val UPLOAD_PARALLELISM = 3
 /**
  * Per-file upload event surfaced to UI (Settings sync progress).
  *
- * Status transitions per file: `Queued` → `Encrypting` → `Uploading` → (`Done` | `Failed`).
+ * Status transitions per file: `Queued` → `Encrypting` → `Uploading` → (`Done` | `Failed`). A video
+ * that is compressed goes `Queued` while it waits for the transcode, `Compressing` while it runs, and
+ * `Queued` again until it gets an upload slot back.
  * `done` and `total` are batch-level counters so the UI can render a single linear bar without
  * keeping its own state.
  *
@@ -145,7 +148,7 @@ private const val UPLOAD_PARALLELISM = 3
  * closing `Idle` frame rather than preceding it, because `Idle` is what observers clear the panel
  * on, and a reason wiped in the same breath would leave the backup looking merely finished.
  */
-enum class UploadStatus { Queued, Encrypting, Uploading, Done, Failed, Idle, WaitingForWifi, PreparingBackup, StorageFull }
+enum class UploadStatus { Queued, Compressing, Encrypting, Uploading, Done, Failed, Idle, WaitingForWifi, PreparingBackup, StorageFull }
 
 data class UploadProgress(
     val uri: String,
@@ -162,6 +165,11 @@ data class UploadProgress(
      * meter updates DURING a single large upload instead of only ticking on file completion.
      */
     val doneBytes: Long = 0L,
+    /** `Compressing` only: the transcode's 0..1 progress, the codec MIME type it produces, and its
+     *  speed in seconds of video per second. */
+    val compressFraction: Float = 0f,
+    val compressCodecMime: String? = null,
+    val compressSpeedX: Float? = null,
 )
 
 @Singleton
@@ -638,6 +646,8 @@ class UploadPendingUseCase @Inject constructor(
         // Source URIs of the photos that upload cleanly, for the History thumbnails. Thread-safe
         // because the parallel tasks add to it concurrently.
         val successUris = java.util.concurrent.ConcurrentLinkedQueue<String>()
+        // What compression saved on the files that uploaded, for the History entry.
+        val savedBytes = AtomicLong(0L)
 
         try {
             coroutineScope {
@@ -685,6 +695,7 @@ class UploadPendingUseCase @Inject constructor(
                                 finishedCount = finishedCount,
                                 onStorageFull = { storageFullHit.set(true) },
                                 uploadSlot = uploadSemaphore,
+                                savedBytes = savedBytes,
                             )
                         }
                         if (transcodes) videoLane.withPermit { upload() } else upload()
@@ -713,6 +724,7 @@ class UploadPendingUseCase @Inject constructor(
         transferCenter.log(
             eu.akoos.photos.data.transfer.TransferCenter.Kind.UPLOAD, finalSuccess,
             uris = successUris.toList(),
+            savedBytes = savedBytes.get(),
         )
         // Refresh the consent notification with the latest pending queue. Same
         // call MainActivity.onResume fires so an externally deleted file (file
@@ -767,6 +779,7 @@ class UploadPendingUseCase @Inject constructor(
         onStorageFull: () -> Unit,
         /** The batch's upload slots; this item holds one and hands it back while it transcodes. */
         uploadSlot: Semaphore,
+        savedBytes: AtomicLong,
     ) {
         var strippedFile: File? = null
         var compressedFile: File? = null
@@ -1121,11 +1134,37 @@ class UploadPendingUseCase @Inject constructor(
                 // Probe, plan and transcode behind the process-wide gate, with this item's upload slot
                 // handed back meanwhile so photos keep uploading. A stopped worker cancels the
                 // transcode. Without a file the original uploads; the diagnostics line says why.
-                val attempt = uploadSlot.releasedWhile {
-                    videoTranscodeGate.withPermit {
-                        videoCompression.compress(strippedUploadUri, videoProfile, localItem.dateTaken)
-                    }
+                fun emitPhase(status: UploadStatus, sizeBytes: Long, compress: VideoUploadCompressor.Progress? = null) {
+                    _progress.tryEmit(
+                        UploadProgress(
+                            uri = state.localUri,
+                            displayName = localItem.displayName,
+                            status = status,
+                            doneIdx = finishedCount.get(),
+                            totalCount = totalCount,
+                            sizeBytes = sizeBytes,
+                            compressFraction = compress?.fraction ?: 0f,
+                            compressCodecMime = compress?.codec?.mimeType,
+                            compressSpeedX = compress?.speedX,
+                        )
+                    )
                 }
+                val attempt = uploadSlot.releasedWhile {
+                    emitPhase(UploadStatus.Queued, localItem.sizeBytes)
+                    videoTranscodeGate.withPermit {
+                        videoCompression.compress(
+                            sourceUri = strippedUploadUri,
+                            profile = videoProfile,
+                            captureDateMs = localItem.dateTaken,
+                            onPlanned = { plan ->
+                                emitPhase(UploadStatus.Compressing, localItem.sizeBytes, VideoUploadCompressor.Progress(0f, plan.codec, null))
+                            },
+                            onProgress = { emitPhase(UploadStatus.Compressing, localItem.sizeBytes, it) },
+                        )
+                    }.also { emitPhase(UploadStatus.Queued, it.file?.length() ?: localItem.sizeBytes) }
+                }
+                // Back to the pre-network phase for the encrypt that follows.
+                emitPhase(UploadStatus.Encrypting, attempt.file?.length() ?: localItem.sizeBytes)
                 logCompression(
                     state.localUri, "video", attempt.outcome, attempt.reason,
                     attempt.sourceBytes ?: localItem.sizeBytes, attempt.outputBytes, attempt.codecMime, attempt.detail,
@@ -1215,6 +1254,8 @@ class UploadPendingUseCase @Inject constructor(
             // when compression produced one (strippedFile was cleared to it above), the stripped temp
             // otherwise, else the original. Keeps sizeBytes / progress / xAttr aligned with the wire.
             val uploadTempFile = compressedFile ?: strippedFile
+            // Kept for the batch's savings, since compressedFile is deleted below.
+            val compressedSize = compressedFile?.length() ?: 0L
             val sizedItem = if (uploadTempFile != null)
                 localItem.copy(sizeBytes = uploadTempFile.length())
             else
@@ -1458,6 +1499,7 @@ class UploadPendingUseCase @Inject constructor(
 
             successCount.incrementAndGet()
             successUris.add(state.localUri)
+            if (compressedSize > 0L) savedBytes.addAndGet((localItem.sizeBytes - compressedSize).coerceAtLeast(0L))
             val doneNow = finishedCount.incrementAndGet()
             Log.d(UPLOAD_TAG, "Upload OK: ${localItem.displayName} → cloudId=$cloudId")
             _progress.tryEmit(

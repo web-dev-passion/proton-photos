@@ -26,6 +26,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.res.stringResource
 import eu.akoos.photos.R
 import eu.akoos.photos.domain.entity.compression.VideoCodec
+import java.text.DecimalFormat
+import kotlin.math.roundToInt
 
 @Composable
 fun codecDisplayName(codec: VideoCodec): String = stringResource(
@@ -35,3 +37,18 @@ fun codecDisplayName(codec: VideoCodec): String = stringResource(
         VideoCodec.AV1 -> R.string.codec_name_av1
     }
 )
+
+/** "1.8×": one decimal under ten, none above. */
+@Composable
+private fun speedLabel(speedX: Float): String {
+    val formatted = if (speedX < 10f) DecimalFormat("0.0").format(speedX.toDouble()) else speedX.roundToInt().toString()
+    return stringResource(R.string.compression_speed_x, formatted)
+}
+
+/** "Compressing 42% · H.265 · 1.8×": the codec and the speed once known. */
+@Composable
+fun compressingLabel(fraction: Float, codecMime: String?, speedX: Float?): String = buildList {
+    add(stringResource(R.string.upload_status_compressing_percent, (fraction.coerceIn(0f, 1f) * 100).roundToInt()))
+    VideoCodec.fromMime(codecMime)?.let { add(codecDisplayName(it)) }
+    speedX?.takeIf { it > 0f }?.let { add(speedLabel(it)) }
+}.joinToString(" · ")
