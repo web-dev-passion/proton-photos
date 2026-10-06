@@ -103,8 +103,15 @@ private val STALE_UPLOAD_TEMP_MS = java.util.concurrent.TimeUnit.DAYS.toMillis(3
  * hardware video encoder, so two concurrent transcodes (possible with [UPLOAD_PARALLELISM]
  * in-flight uploads) would fail or thrash. File-level so the limit holds across every upload
  * coroutine and batch regardless of how many use-case instances exist.
+ *
+ * A video hands its upload slot back while it waits for and runs the transcode (see [releasedWhile]),
+ * so photos keep uploading behind a long transcode.
  */
 private val videoTranscodeGate = Semaphore(1)
+
+/** Compressible videos per batch allowed past the video lane at once, which bounds the temp copies on
+ *  disk. Taken before the upload slot, so a video waiting here holds nothing a photo needs. */
+private const val VIDEO_PIPELINE_DEPTH = 2
 
 /**
  * Per-batch upload parallelism. Three concurrent uploads matches the inner CDN-block
@@ -534,9 +541,13 @@ class UploadPendingUseCase @Inject constructor(
         // from a folder the user just turned off keep uploading until the queue drains, so the
         // backup looks like it ignores the toggle. bucketName lives on LocalMediaItem, not
         // SyncState, so one MediaStore query mapped by URI resolves each pending row's folder.
+        // The same listing gives each pending row's MIME type, so the batch knows which videos queue
+        // for the video lane.
+        var mimeByUri: Map<String, String> = emptyMap()
         if (pending.isNotEmpty()) {
-            val bucketByUri: Map<String, String?> = localRepo.observeLocalMedia().first()
-                .associate { it.uri to it.bucketName }
+            val listing = localRepo.observeLocalMedia().first()
+            mimeByUri = listing.associate { it.uri to it.mimeType }
+            val bucketByUri: Map<String, String?> = listing.associate { it.uri to it.bucketName }
             val before = pending.size
             pending = pending.filter { state ->
                 // A photo queued by an explicit user action (manual "back up now" or album-add) always
@@ -610,6 +621,8 @@ class UploadPendingUseCase @Inject constructor(
         // the CDN-block parallelism inside PhotoUploadService so a single batch fully uses the
         // pipe without over-subscribing it.
         val uploadSemaphore = Semaphore(UPLOAD_PARALLELISM)
+        // Compressible videos take this before an upload slot (see [VIDEO_PIPELINE_DEPTH]).
+        val videoLane = Semaphore(VIDEO_PIPELINE_DEPTH)
         // Album-cache mutations (read-check-create-publish) race when multiple uploads target
         // the same new album. Guard cache reads/writes + the DataStore persist with this mutex
         // so two parallel uploads of "Camera" photos don't both call createDriveAlbum.
@@ -639,7 +652,9 @@ class UploadPendingUseCase @Inject constructor(
                         coroutineContext.ensureActive()
                         if (stopRequested.get() || storageFullHit.get()) return@async
 
-                        uploadSemaphore.withPermit {
+                        val transcodes = compressVideosOnUpload &&
+                            mimeByUri[state.localUri]?.startsWith("video/") == true
+                        suspend fun upload() = uploadSemaphore.withPermit {
                             // Re-check after acquiring the permit — earlier tasks may have set
                             // storageFullHit / stopRequested while we were queued.
                             coroutineContext.ensureActive()
@@ -669,8 +684,10 @@ class UploadPendingUseCase @Inject constructor(
                                 successUris = successUris,
                                 finishedCount = finishedCount,
                                 onStorageFull = { storageFullHit.set(true) },
+                                uploadSlot = uploadSemaphore,
                             )
                         }
+                        if (transcodes) videoLane.withPermit { upload() } else upload()
                     }
                 }
                 // awaitAll surfaces the first thrown exception (and cancels the siblings).
@@ -748,6 +765,8 @@ class UploadPendingUseCase @Inject constructor(
         successUris: MutableCollection<String>,
         finishedCount: AtomicInteger,
         onStorageFull: () -> Unit,
+        /** The batch's upload slots; this item holds one and hands it back while it transcodes. */
+        uploadSlot: Semaphore,
     ) {
         var strippedFile: File? = null
         var compressedFile: File? = null
@@ -1099,11 +1118,13 @@ class UploadPendingUseCase @Inject constructor(
                     strippedUploadUri
                 }
             } else if (compressVideosOnUpload && localItem.mimeType.startsWith("video/")) {
-                // Probe, plan and transcode behind the process-wide gate so only one encode runs at a
-                // time. A stopped worker cancels the transcode. Without a file the original uploads;
-                // the diagnostics line says why.
-                val attempt = videoTranscodeGate.withPermit {
-                    videoCompression.compress(strippedUploadUri, videoProfile, localItem.dateTaken)
+                // Probe, plan and transcode behind the process-wide gate, with this item's upload slot
+                // handed back meanwhile so photos keep uploading. A stopped worker cancels the
+                // transcode. Without a file the original uploads; the diagnostics line says why.
+                val attempt = uploadSlot.releasedWhile {
+                    videoTranscodeGate.withPermit {
+                        videoCompression.compress(strippedUploadUri, videoProfile, localItem.dateTaken)
+                    }
                 }
                 logCompression(
                     state.localUri, "video", attempt.outcome, attempt.reason,
@@ -2026,4 +2047,17 @@ private fun logCompression(
     ).joinToString(" ")
     Log.d(UPLOAD_TAG, line)
     eu.akoos.photos.util.SyncDiagnostics.log(line)
+}
+
+/**
+ * Runs [block] with one held permit handed back. The re-acquire can't be cancelled, because the
+ * enclosing `withPermit` releases one on the way out whatever happens.
+ */
+internal suspend fun <T> Semaphore.releasedWhile(block: suspend () -> T): T {
+    release()
+    try {
+        return block()
+    } finally {
+        withContext(NonCancellable) { acquire() }
+    }
 }

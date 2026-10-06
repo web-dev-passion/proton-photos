@@ -34,7 +34,10 @@ import io.mockk.mockk
 import io.mockk.mockkObject
 import io.mockk.mockkStatic
 import io.mockk.slot
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.test.runTest
 import me.proton.core.domain.entity.UserId
 import eu.akoos.photos.data.db.dao.UploadAlbumTargetDao
@@ -572,6 +575,45 @@ class UploadPendingUseCaseTest {
 
         assertEquals(UploadCompressionTier.SPACE_SAVER, profile.captured.tier)
         assertEquals(VideoCodecChoice.KEEP_SOURCE, profile.captured.codec)
+    }
+
+    @Test
+    fun `photos keep uploading in parallel while a video transcodes`() = runTest {
+        // Two videos and three photos. The transcode is held open, and each photo upload returns only
+        // once all three are in flight at the same time, which needs every upload slot: the videos
+        // must hand theirs back while they transcode or wait for the transcode gate.
+        every { mockPrefsRef[SettingsKeys.COMPRESS_VIDEO_ON_UPLOAD] } returns true
+        val uris = listOf("uri://v1", "uri://v2", "uri://p1", "uri://p2", "uri://p3")
+        every { syncStateRepo.observeAll(userId) } returns flowOf(uris.map { syncState(it, SyncStatus.LOCAL_ONLY) })
+        val items = uris.map { if (it.startsWith("uri://v")) videoItem(it) else localItem(it) }
+        every { localRepo.observeLocalMedia() } returns flowOf(items)
+        coEvery { localRepo.queryByUri(any()) } answers { items.first { it.uri == firstArg<String>() } }
+
+        val transcodeRelease = CompletableDeferred<Unit>()
+        coEvery {
+            videoCompression.compress(any(), any(), any(), any(), any())
+        } coAnswers {
+            transcodeRelease.await()
+            skippedAttempt()
+        }
+        val photosInFlight = java.util.concurrent.atomic.AtomicInteger(0)
+        val allPhotosInFlight = CompletableDeferred<Unit>()
+        coEvery { cloudRepo.uploadFile(userId, any(), any(), any(), any(), any()) } coAnswers {
+            val item = arg<LocalMediaItem>(1)
+            if (item.mimeType.startsWith("image/")) {
+                if (photosInFlight.incrementAndGet() == 3) allPhotosInFlight.complete(Unit)
+                allPhotosInFlight.await()
+            }
+            "cloud-" + item.uri
+        }
+
+        val batch = launch { useCase(userId) }
+        withTimeout(10_000L) { allPhotosInFlight.await() }
+        // The photos made it through while the transcode was still running.
+        assertTrue(!transcodeRelease.isCompleted)
+        transcodeRelease.complete(Unit)
+        batch.join()
+        coVerify(exactly = 5) { cloudRepo.uploadFile(userId, any(), any(), any(), any(), any()) }
     }
 
     private fun videoItem(uri: String) = LocalMediaItem(
