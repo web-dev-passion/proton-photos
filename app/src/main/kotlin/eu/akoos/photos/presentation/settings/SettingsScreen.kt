@@ -223,6 +223,8 @@ fun SettingsScreen(
     onCheckForUpdatesClick: () -> Unit = {},
     onWhatsNewClick: () -> Unit = {},
     onNewsClick: () -> Unit = {},
+    /** DEBUG only: opens a screen by route from the compression preview card. */
+    onDebugNavigate: (String) -> Unit = {},
     /** Opens a settings-search result by its NavGraph route (top-level pages and the query-string
      *  destinations the index points at); the inline search resets when this fires. */
     onOpenRoute: (String) -> Unit = {},
@@ -851,6 +853,8 @@ fun SettingsScreen(
                 DebugDialogTestCard()
                 Spacer(Modifier.height(20.dp))
                 DeviceHealthDebugCard()
+                Spacer(Modifier.height(20.dp))
+                CompressionDebugCard(onDebugNavigate)
             }
                     }
                 } else {
@@ -3080,6 +3084,18 @@ internal fun ProtonStorageRow(state: SettingsUiState) {
 // ── Shared composables ────────────────────────────────────────────────────────
 
 // ── Debug-only preview drawers + large-library simulator ──────────────────────
+
+/** Debug-only shortcuts to the account-only Activity and Upload processing screens, so the compression
+ *  UI can be checked in guest mode. Compiled out of release by the BuildConfig.DEBUG guard at the only
+ *  call site. English-only labels: a developer tool. */
+@Composable
+private fun CompressionDebugCard(onNavigate: (String) -> Unit) {
+    SettingsCard {
+        NavRow("Compression: Activity preview", "Uploads tab; toggle its Test mode") { onNavigate("activity?tab=uploads") }
+        RowDivider()
+        NavRow("Compression: Upload processing", "Codec and quality options") { onNavigate("backup_processing") }
+    }
+}
 
 /** Debug-only preview buttons for the app's warning / confirm / error drawers, so each can be seen
  *  and tuned without reproducing the real condition. Compiled out of release by the BuildConfig.DEBUG
