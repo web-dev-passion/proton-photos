@@ -51,6 +51,7 @@ import me.proton.core.domain.entity.UserId
 import eu.akoos.photos.data.preferences.SettingsKeys
 import eu.akoos.photos.data.preferences.settingsDataStore
 import eu.akoos.photos.data.upload.MirrorOverwriteJournal
+import eu.akoos.photos.data.upload.UploadImageCompressor
 import eu.akoos.photos.domain.entity.QueueSource
 import eu.akoos.photos.domain.entity.StorageFullException
 import eu.akoos.photos.domain.entity.SyncState
@@ -748,6 +749,9 @@ class UploadPendingUseCase @Inject constructor(
         // A temp holding a timestamp-floored copy of an uncompressed video (Fix: backup video mvhd
         // floor). Tracked alongside the other temps so it is cleaned up on both success and failure.
         var tsFloorFile: File? = null
+        // JPEG when a re-encode (photo compression or the HEIC strip transcode) changed the format,
+        // so the upload's name and MIME type follow the bytes.
+        var producedImageMime: String? = null
         try {
             val rawLocalItem = localRepo.queryByUri(state.localUri)
             if (rawLocalItem == null) {
@@ -993,6 +997,7 @@ class UploadPendingUseCase @Inject constructor(
                             .transcodeStrippedJpeg(context, state.localUri, stripConfig)
                         if (transcoded != null) {
                             strippedFile = transcoded
+                            producedImageMime = UploadImageCompressor.JPEG_MIME
                             Log.d(UPLOAD_TAG, "Stripped JPEG transcoded for ${localItem.displayName} (unwritable container)")
                             android.net.Uri.fromFile(transcoded).toString()
                         } else {
@@ -1074,6 +1079,7 @@ class UploadPendingUseCase @Inject constructor(
                     .compressToTemp(context, strippedUploadUri, compressTier, compressStripConfig)
                 if (compressed != null) {
                     compressedFile = compressed
+                    producedImageMime = UploadImageCompressor.JPEG_MIME
                     // The stripped temp (if any) is now superseded by the compressed copy, so delete
                     // it so a strip+compress pass doesn't leak the intermediate. The compressed file is
                     // the only temp we still need, tracked for cleanup in the finally below.
@@ -1182,10 +1188,15 @@ class UploadPendingUseCase @Inject constructor(
             // when compression produced one (strippedFile was cleared to it above), the stripped temp
             // otherwise, else the original. Keeps sizeBytes / progress / xAttr aligned with the wire.
             val uploadTempFile = compressedFile ?: strippedFile
-            val uploadItem = if (uploadTempFile != null)
+            val sizedItem = if (uploadTempFile != null)
                 localItem.copy(sizeBytes = uploadTempFile.length())
             else
                 localItem
+            // After a re-encode the name and MIME type follow the bytes; the device file keeps its own.
+            val (uploadName, uploadMime) = UploadFormatNaming.forProducedFormat(
+                sizedItem.displayName, sizedItem.mimeType, producedImageMime,
+            )
+            val uploadItem = sizedItem.copy(displayName = uploadName, mimeType = uploadMime)
 
             // Throttled progress relay. PhotoUploadService already debounces to ~250 ms per
             // phase, but a single batch can have multiple uploads in flight (UPLOAD_PARALLELISM

@@ -229,7 +229,10 @@ object UploadImageCompressor {
         return normalized in JPEG_MIMES
     }
 
-    private val JPEG_MIMES = setOf("image/jpeg", "image/jpg")
+    /** The MIME type of every file this compressor (and the strip transcode) writes. */
+    const val JPEG_MIME = "image/jpeg"
+
+    private val JPEG_MIMES = setOf(JPEG_MIME, "image/jpg")
 
     fun needsStripTranscode(
         mimeType: String,

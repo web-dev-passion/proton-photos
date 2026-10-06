@@ -212,7 +212,12 @@ class ReconcileSyncStateUseCase @Inject constructor(
 
             // captureTime in CloudPhoto is Unix seconds; LocalMediaItem.dateTaken is ms.
             val localCaptureTimeSec = local.dateTaken / 1000L
+            // A compressed or strip-transcoded photo went up as JPEG (IMG.heic as IMG.jpg), so while
+            // either rewrite is on, look for that name too.
             val nameDateTwin = cloudByNameAndDate[local.displayName to localCaptureTimeSec]
+                ?: UploadFormatNaming.reencodedName(local.displayName, local.mimeType)
+                    ?.takeIf { compressOnUpload || stripOnUpload }
+                    ?.let { cloudByNameAndDate[it to localCaptureTimeSec] }
             val nameCandidate = nameDateTwin
                 ?: cloudByNameSize[local.displayName to local.sizeBytes]?.takeIf { it.sizeBytes > 0 }
             // Trust a name+date / name+size match ONLY when a content hash can't settle it: the cloud

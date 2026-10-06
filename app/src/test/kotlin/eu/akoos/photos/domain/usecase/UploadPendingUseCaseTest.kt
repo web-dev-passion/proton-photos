@@ -516,6 +516,35 @@ class UploadPendingUseCaseTest {
     }
 
     @Test
+    fun `a compressed heic uploads under a jpeg name and type that match its bytes`() = runTest {
+        every { mockPrefsRef[SettingsKeys.COMPRESS_ON_UPLOAD] } returns true
+        val heic = LocalMediaItem(
+            uri = "uri://heic", dateTaken = 1000L, displayName = "IMG_0007.HEIC",
+            mimeType = "image/heic", sizeBytes = 4096L, bucketName = "Camera",
+        )
+        every { syncStateRepo.observeAll(userId) } returns flowOf(listOf(syncState("uri://heic", SyncStatus.LOCAL_ONLY)))
+        coEvery { localRepo.queryByUri("uri://heic") } returns heic
+        val sent = slot<LocalMediaItem>()
+        coEvery { cloudRepo.uploadFile(userId, capture(sent), any(), any(), any(), any()) } returns "cloud-id"
+        val temp = java.io.File.createTempFile("compressed_", ".jpg").apply { writeBytes(ByteArray(100)) }
+        mockkStatic(Uri::class)
+        every { Uri.fromFile(any()) } answers {
+            mockk<Uri> { every { this@mockk.toString() } returns "file://" + firstArg<java.io.File>().path }
+        }
+        mockkObject(UploadImageCompressor) {
+            every { UploadImageCompressor.skipsCompressionForGainMap(any(), any(), any()) } returns false
+            every { UploadImageCompressor.compressToTemp(any(), any(), any(), any()) } returns temp
+            useCase(userId)
+        }
+        io.mockk.unmockkStatic(Uri::class)
+
+        assertEquals("IMG_0007.JPG", sent.captured.displayName)
+        assertEquals("image/jpeg", sent.captured.mimeType)
+        assertEquals(100L, sent.captured.sizeBytes)
+        temp.delete()
+    }
+
+    @Test
     fun `video compression params come from the video tier, distinct from the photo tier`() {
         // The video path derives its transcode knobs from the VIDEO tier through
         // videoCompressionParamsFor (the function the upload path's video branch calls with
