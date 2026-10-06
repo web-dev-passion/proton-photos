@@ -41,6 +41,11 @@ import eu.akoos.photos.data.db.dao.UploadAlbumTargetDao
 import eu.akoos.photos.data.preferences.SettingsKeys
 import eu.akoos.photos.data.preferences.settingsDataStore
 import eu.akoos.photos.data.upload.UploadImageCompressor
+import eu.akoos.photos.data.upload.compression.VideoUploadCompression
+import eu.akoos.photos.domain.entity.compression.CompressionOutcome
+import eu.akoos.photos.domain.entity.compression.CompressionSkipReason
+import eu.akoos.photos.domain.entity.compression.VideoCodecChoice
+import eu.akoos.photos.domain.entity.compression.VideoCompressionProfile
 import eu.akoos.photos.domain.entity.LocalMediaItem
 import eu.akoos.photos.domain.entity.UploadCompressionTier
 import eu.akoos.photos.domain.entity.QueueSource
@@ -69,6 +74,7 @@ class UploadPendingUseCaseTest {
     private lateinit var uploadAlbumTargetDao: UploadAlbumTargetDao
     private lateinit var context: Context
     private lateinit var useCase: UploadPendingUseCase
+    private lateinit var videoCompression: VideoUploadCompression
     // Hoisted so individual tests can flip a single pref (e.g. the strip-timestamp flags) after setUp.
     private lateinit var mockPrefsRef: Preferences
     private val userId = UserId("test-user")
@@ -140,6 +146,8 @@ class UploadPendingUseCaseTest {
         every { mockPrefs[SettingsKeys.COMPRESS_UPLOAD_TIER] } returns null
         every { mockPrefs[SettingsKeys.COMPRESS_UPLOAD_TIER_VIDEO] } returns null
         every { mockPrefs[SettingsKeys.MIRROR_COMPRESS_TO_LOCAL] } returns false
+        every { mockPrefs[SettingsKeys.COMPRESS_VIDEO_CODEC] } returns null
+        every { mockPrefs[SettingsKeys.COMPRESS_CODEC_MIGRATED] } returns null
         every { mockPrefs[SettingsKeys.PENDING_ALBUM_ADDS] } returns emptySet()
         every { mockPrefs[SettingsKeys.PENDING_DELETE_URIS] } returns emptySet()
         // Wi-Fi-only off so the network guard never short-circuits the upload loop.
@@ -151,10 +159,11 @@ class UploadPendingUseCaseTest {
         )
         every { mockPrefs[SettingsKeys.pairingSettledKey(userId.id)] } returns true
 
+        videoCompression = mockk(relaxed = true)
         useCase = UploadPendingUseCase(
             syncStateRepo, localRepo, cloudRepo, mockk(relaxed = true), networkObserver,
             mockk(relaxed = true), uploadAlbumTargetDao, mockk(relaxed = true), mockk(relaxed = true),
-            UploadStructuralStripper(context), context,
+            UploadStructuralStripper(context), videoCompression, context,
             kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Unconfined + kotlinx.coroutines.CoroutineExceptionHandler { _, _ -> }),
         )
     }
@@ -502,13 +511,13 @@ class UploadPendingUseCaseTest {
         coEvery { cloudRepo.uploadFile(userId, any(), any(), any(), any(), any()) } returns "cloud-id"
 
         val photoTierSlot = slot<UploadCompressionTier>()
-        // The compressor returns null so the upload proceeds with the original bytes; the test only
+        // The compressor produces nothing so the upload proceeds with the original bytes; the test only
         // cares which tier the branch hands it. mockkObject unmocks on block exit.
         mockkObject(UploadImageCompressor) {
             every { UploadImageCompressor.skipsCompressionForGainMap(any(), any(), any()) } returns false
             every {
-                UploadImageCompressor.compressToTemp(any(), any(), capture(photoTierSlot), any())
-            } returns null
+                UploadImageCompressor.compress(any(), any(), capture(photoTierSlot), any())
+            } returns UploadImageCompressor.Outcome(null, CompressionSkipReason.NOT_SMALLER, 1024L)
             useCase(userId)
         }
 
@@ -533,7 +542,8 @@ class UploadPendingUseCaseTest {
         }
         mockkObject(UploadImageCompressor) {
             every { UploadImageCompressor.skipsCompressionForGainMap(any(), any(), any()) } returns false
-            every { UploadImageCompressor.compressToTemp(any(), any(), any(), any()) } returns temp
+            every { UploadImageCompressor.compress(any(), any(), any(), any()) } returns
+                UploadImageCompressor.Outcome(temp, null, 4096L)
             useCase(userId)
         }
         io.mockk.unmockkStatic(Uri::class)
@@ -545,19 +555,36 @@ class UploadPendingUseCaseTest {
     }
 
     @Test
-    fun `video compression params come from the video tier, distinct from the photo tier`() {
-        // The video path derives its transcode knobs from the VIDEO tier through
-        // videoCompressionParamsFor (the function the upload path's video branch calls with
-        // videoCompressTier). SPACE_SAVER yields SPACE_SAVER's short-edge cap and bitrate, and a
-        // different tier yields different knobs, so photo and video no longer share one level.
-        val videoParams = videoCompressionParamsFor(UploadCompressionTier.SPACE_SAVER)
-        assertEquals(UploadCompressionTier.SPACE_SAVER.videoMaxShortEdgePx, videoParams.maxShortEdgePx)
-        assertEquals(UploadCompressionTier.SPACE_SAVER.videoBitrateBps, videoParams.targetBitrateBps)
-        assertNotEquals(
-            videoCompressionParamsFor(UploadCompressionTier.LIGHT),
-            videoCompressionParamsFor(UploadCompressionTier.SPACE_SAVER),
-        )
+    fun `video compression plans with the video tier, distinct from the photo tier`() = runTest {
+        every { mockPrefsRef[SettingsKeys.COMPRESS_VIDEO_ON_UPLOAD] } returns true
+        every { mockPrefsRef[SettingsKeys.COMPRESS_UPLOAD_TIER] } returns UploadCompressionTier.LIGHT.ordinal
+        every { mockPrefsRef[SettingsKeys.COMPRESS_UPLOAD_TIER_VIDEO] } returns UploadCompressionTier.SPACE_SAVER.ordinal
+        every { syncStateRepo.observeAll(userId) } returns flowOf(listOf(syncState("uri://vid", SyncStatus.LOCAL_ONLY)))
+        every { localRepo.observeLocalMedia() } returns flowOf(listOf(videoItem("uri://vid")))
+        coEvery { localRepo.queryByUri("uri://vid") } returns videoItem("uri://vid")
+        coEvery { cloudRepo.uploadFile(userId, any(), any(), any(), any(), any()) } returns "cloud-id"
+        val profile = slot<VideoCompressionProfile>()
+        coEvery {
+            videoCompression.compress(any(), capture(profile), any(), any(), any())
+        } returns skippedAttempt()
+
+        useCase(userId)
+
+        assertEquals(UploadCompressionTier.SPACE_SAVER, profile.captured.tier)
+        assertEquals(VideoCodecChoice.KEEP_SOURCE, profile.captured.codec)
     }
+
+    private fun videoItem(uri: String) = LocalMediaItem(
+        uri = uri,
+        dateTaken = 1000L,
+        displayName = "clip.mp4",
+        mimeType = "video/mp4",
+        sizeBytes = 10_000_000L,
+        bucketName = "Camera",
+    )
+
+    private fun skippedAttempt() =
+        VideoUploadCompression.Attempt(null, CompressionOutcome.SKIPPED, CompressionSkipReason.ALREADY_EFFICIENT)
 
     /**
      * Runs [block] with [ExifHelper]'s strip entry points stubbed to a clean no-op, unmocking on exit

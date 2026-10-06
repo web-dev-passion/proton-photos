@@ -50,13 +50,18 @@ import kotlinx.coroutines.withContext
 import me.proton.core.domain.entity.UserId
 import eu.akoos.photos.data.preferences.SettingsKeys
 import eu.akoos.photos.data.preferences.settingsDataStore
+import eu.akoos.photos.data.preferences.CompressionPreferences
 import eu.akoos.photos.data.upload.MirrorOverwriteJournal
 import eu.akoos.photos.data.upload.UploadImageCompressor
+import eu.akoos.photos.data.upload.compression.VideoUploadCompression
 import eu.akoos.photos.domain.entity.QueueSource
 import eu.akoos.photos.domain.entity.StorageFullException
 import eu.akoos.photos.domain.entity.SyncState
 import eu.akoos.photos.domain.entity.SyncStatus
 import eu.akoos.photos.domain.entity.UploadCompressionTier
+import eu.akoos.photos.domain.entity.compression.CompressionOutcome
+import eu.akoos.photos.domain.entity.compression.CompressionSkipReason
+import eu.akoos.photos.domain.entity.compression.VideoCompressionProfile
 import eu.akoos.photos.domain.repository.DrivePhotoRepository
 import eu.akoos.photos.domain.repository.LocalMediaRepository
 import eu.akoos.photos.domain.repository.SyncStateRepository
@@ -164,6 +169,7 @@ class UploadPendingUseCase @Inject constructor(
     private val pendingMetadataEditDao: eu.akoos.photos.data.db.dao.PendingMetadataEditDao,
     private val photoLocationDao: eu.akoos.photos.data.db.dao.PhotoLocationDao,
     private val structuralStripper: UploadStructuralStripper,
+    private val videoCompression: VideoUploadCompression,
     @ApplicationContext private val context: Context,
     @eu.akoos.photos.di.AppScope private val appScope: kotlinx.coroutines.CoroutineScope,
 ) {
@@ -333,8 +339,7 @@ class UploadPendingUseCase @Inject constructor(
         val compressTier = UploadCompressionTier
             .fromOrdinalOrDefault(prefs[SettingsKeys.COMPRESS_UPLOAD_TIER] ?: -1)
         // #108: the video path re-encodes at its own tier, seeded from the shared value on upgrade.
-        val videoCompressTier = UploadCompressionTier
-            .fromOrdinalOrDefault(prefs[SettingsKeys.COMPRESS_UPLOAD_TIER_VIDEO] ?: -1)
+        val videoProfile = CompressionPreferences.videoProfile(prefs)
         val mirrorStripToLocal = prefs[SettingsKeys.MIRROR_STRIP_TO_LOCAL] ?: false
         val mirrorCompressToLocal = prefs[SettingsKeys.MIRROR_COMPRESS_TO_LOCAL] ?: false
         val compressVideosOnUpload = prefs[SettingsKeys.COMPRESS_VIDEO_ON_UPLOAD] ?: false
@@ -650,7 +655,7 @@ class UploadPendingUseCase @Inject constructor(
                                 stripOnUpload = stripOnUpload,
                                 compressOnUpload = compressOnUpload,
                                 compressTier = compressTier,
-                                videoCompressTier = videoCompressTier,
+                                videoProfile = videoProfile,
                                 mirrorStripToLocal = mirrorStripToLocal,
                                 mirrorCompressToLocal = mirrorCompressToLocal,
                                 compressVideosOnUpload = compressVideosOnUpload,
@@ -729,7 +734,7 @@ class UploadPendingUseCase @Inject constructor(
         stripOnUpload: Boolean,
         compressOnUpload: Boolean,
         compressTier: UploadCompressionTier,
-        videoCompressTier: UploadCompressionTier,
+        videoProfile: VideoCompressionProfile,
         mirrorStripToLocal: Boolean,
         mirrorCompressToLocal: Boolean,
         compressVideosOnUpload: Boolean,
@@ -1051,6 +1056,7 @@ class UploadPendingUseCase @Inject constructor(
                 structuralStripper.isMotionPhotoUpload(strippedUploadUri)
             if (compressIsMotionPhoto) {
                 Log.d(UPLOAD_TAG, "Skipping image compression for motion photo ${localItem.displayName}; motion preserved")
+                logCompression(state.localUri, "photo", CompressionOutcome.SKIPPED, CompressionSkipReason.MOTION_PHOTO, localItem.sizeBytes)
             }
             // An Ultra HDR still is the same story with a gain map in place of a clip: the compressor
             // decodes only the primary frame, so re-encoding drops the appended gain map and the photo
@@ -1064,6 +1070,7 @@ class UploadPendingUseCase @Inject constructor(
                 )
             if (compressHasGainMap) {
                 Log.d(UPLOAD_TAG, "Skipping image compression for Ultra HDR ${localItem.displayName}; gain map preserved")
+                logCompression(state.localUri, "photo", CompressionOutcome.SKIPPED, CompressionSkipReason.ULTRA_HDR, localItem.sizeBytes)
             }
             val uploadUri: String = if (compressOnUpload && !compressIsMotionPhoto && !compressHasGainMap &&
                 localItem.mimeType.startsWith("image/")
@@ -1075,8 +1082,9 @@ class UploadPendingUseCase @Inject constructor(
                 // the effective config so those groups are dropped; a no-op when strip-on-upload is off,
                 // so a non-stripping upload still carries the full EXIF byte-for-byte as before.
                 val compressStripConfig = if (stripOnUpload) stripConfig else MetadataStripConfig()
-                val compressed = eu.akoos.photos.data.upload.UploadImageCompressor
-                    .compressToTemp(context, strippedUploadUri, compressTier, compressStripConfig)
+                val outcome = UploadImageCompressor.compress(context, strippedUploadUri, compressTier, compressStripConfig)
+                logCompression(state.localUri, "photo", outcome.outcome, outcome.reason, outcome.sourceBytes, outcome.file?.length())
+                val compressed = outcome.file
                 if (compressed != null) {
                     compressedFile = compressed
                     producedImageMime = UploadImageCompressor.JPEG_MIME
@@ -1091,23 +1099,21 @@ class UploadPendingUseCase @Inject constructor(
                     strippedUploadUri
                 }
             } else if (compressVideosOnUpload && localItem.mimeType.startsWith("video/")) {
-                // Transcode behind the process-wide gate so only one hardware encode runs at a time.
-                // The transcode is a suspend call inside this upload coroutine, so a stopped worker
-                // cancels it. On ANY failure / unsupported / not-smaller / over-ceiling the
-                // compressor returns null and the upload proceeds with the original bytes.
-                val compressed = videoTranscodeGate.withPermit {
-                    eu.akoos.photos.data.upload.VideoUploadCompressor.compressToTemp(
-                        context,
-                        android.net.Uri.parse(strippedUploadUri),
-                        videoCompressionParamsFor(videoCompressTier),
-                        localItem.dateTaken,
-                    )
+                // Probe, plan and transcode behind the process-wide gate so only one encode runs at a
+                // time. A stopped worker cancels the transcode. Without a file the original uploads;
+                // the diagnostics line says why.
+                val attempt = videoTranscodeGate.withPermit {
+                    videoCompression.compress(strippedUploadUri, videoProfile, localItem.dateTaken)
                 }
+                logCompression(
+                    state.localUri, "video", attempt.outcome, attempt.reason,
+                    attempt.sourceBytes ?: localItem.sizeBytes, attempt.outputBytes, attempt.codecMime, attempt.detail,
+                )
+                val compressed = attempt.file
                 if (compressed != null) {
                     compressedFile = compressed
                     strippedFile?.delete()
                     strippedFile = null
-                    Log.d(UPLOAD_TAG, "Compressed video ${localItem.displayName} for upload (tier=${videoCompressTier.name})")
                     android.net.Uri.fromFile(compressed).toString()
                 } else {
                     strippedUploadUri
@@ -1999,14 +2005,25 @@ internal fun uploadDefersForWifiOnly(queueSource: String?, wifiOnly: Boolean, on
         queueSource != QueueSource.ALBUM_ADD
 
 /**
- * #108: the video-transcode knobs the upload path derives from a compression [tier]: the short-edge
- * cap and target bitrate the VIDEO path re-encodes at. The photo path hands the tier straight to the
- * image compressor, so it has no equivalent.
+ * One name-free diagnostics line per compression decision, so release builds (where `Log` is
+ * stripped) still record it, e.g. `compress <ref> video SKIPPED ALREADY_EFFICIENT 24.3MB`. The ref is
+ * the same non-reversible URI hash the other upload lines use.
  */
-internal fun videoCompressionParamsFor(
-    tier: UploadCompressionTier,
-): eu.akoos.photos.data.upload.VideoUploadCompressor.VideoCompressionParams =
-    eu.akoos.photos.data.upload.VideoUploadCompressor.VideoCompressionParams(
-        tier.videoMaxShortEdgePx,
-        tier.videoBitrateBps,
-    )
+private fun logCompression(
+    localUri: String,
+    kind: String,
+    outcome: CompressionOutcome,
+    reason: CompressionSkipReason?,
+    sourceBytes: Long,
+    outputBytes: Long? = null,
+    codec: String? = null,
+    detail: String? = null,
+) {
+    val mb = { b: Long -> "%.1fMB".format(Locale.US, b / 1_000_000.0) }
+    val sizes = if (outputBytes != null && outputBytes > 0L) mb(sourceBytes) + "->" + mb(outputBytes) else mb(sourceBytes)
+    val line = listOfNotNull(
+        "compress", eu.akoos.photos.util.uploadLogRef(localUri), kind, outcome.name, reason?.name, codec, sizes, detail,
+    ).joinToString(" ")
+    Log.d(UPLOAD_TAG, line)
+    eu.akoos.photos.util.SyncDiagnostics.log(line)
+}
