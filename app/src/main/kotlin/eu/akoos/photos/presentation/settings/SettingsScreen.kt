@@ -134,7 +134,7 @@ import eu.akoos.photos.data.semantic.SemanticIndexingState
 import eu.akoos.photos.data.semantic.SemanticModelAssets
 import eu.akoos.photos.data.semantic.SemanticStatusLabel
 import eu.akoos.photos.data.semantic.semanticStatusLabel
-import eu.akoos.photos.domain.entity.UploadCompressionTier
+import eu.akoos.photos.domain.entity.compression.VideoCompressionProfile
 import eu.akoos.photos.presentation.gallery.PersonTile
 import eu.akoos.photos.presentation.search.SearchFilter
 import eu.akoos.photos.presentation.common.ConfirmDialog
@@ -149,6 +149,9 @@ import eu.akoos.photos.presentation.common.ShimmerBox
 import eu.akoos.photos.presentation.common.ShimmerTextLine
 import eu.akoos.photos.util.HealthBlockReason
 import eu.akoos.photos.util.sanitizeErrorMessage
+import eu.akoos.photos.presentation.settings.compression.CodecPicker
+import eu.akoos.photos.presentation.settings.compression.EstimateLine
+import eu.akoos.photos.presentation.settings.compression.PresetPicker
 import eu.akoos.photos.presentation.settings.components.ActionRow
 import eu.akoos.photos.presentation.settings.components.AppLockTimeoutRow
 import eu.akoos.photos.presentation.settings.components.CollapsibleSection
@@ -2205,8 +2208,9 @@ fun BackupProcessingScreen(
                 },
             )
         }
-        // The type toggles each carry their own quality tier list: photos and videos pick a tier
-        // independently, and each list is revealed only while its own toggle is on. (#108)
+        // Photos and videos each have their own switch and, once on, their own quality (#108). Videos
+        // also pick a codec.
+        Spacer(Modifier.height(12.dp))
         SettingsCard {
             ToggleRow(
                 label = stringResource(R.string.settings_compress_photos),
@@ -2214,35 +2218,40 @@ fun BackupProcessingScreen(
                 checked = state.compressOnUpload,
                 onCheckedChange = viewModel::setCompressOnUpload,
             )
-            // Photo quality tier, bound to the photo tier state.
             if (state.compressOnUpload) {
-                UploadCompressionTier.entries.forEach { tier ->
-                    RowDivider()
-                    CompressTierRow(
-                        label = stringResource(tier.labelRes),
-                        description = stringResource(tier.descRes),
-                        selected = state.compressTier == tier,
-                        onClick = { viewModel.setCompressTier(tier) },
-                    )
-                }
+                RowDivider()
+                PresetPicker(
+                    selected = state.compressTier,
+                    onSelect = viewModel::setCompressTier,
+                    descriptionRes = { it.descRes },
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+                )
             }
-            RowDivider()
+        }
+        Spacer(Modifier.height(12.dp))
+        SettingsCard {
             ToggleRow(
                 label = stringResource(R.string.settings_compress_videos),
                 description = stringResource(R.string.settings_compress_videos_desc),
                 checked = state.compressVideosOnUpload,
                 onCheckedChange = viewModel::setCompressVideosOnUpload,
             )
-            // Video quality tier, bound to the separate video tier state.
             if (state.compressVideosOnUpload) {
-                UploadCompressionTier.entries.forEach { tier ->
-                    RowDivider()
-                    CompressTierRow(
-                        label = stringResource(tier.labelRes),
-                        description = stringResource(tier.descRes),
-                        selected = state.compressTierVideo == tier,
-                        onClick = { viewModel.setCompressTierVideo(tier) },
+                RowDivider()
+                Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
+                    CodecPicker(
+                        selected = state.videoCodec,
+                        capabilities = state.encoderCapabilities,
+                        onSelect = viewModel::setVideoCodec,
                     )
+                    Spacer(Modifier.height(16.dp))
+                    PresetPicker(
+                        selected = state.compressTierVideo,
+                        onSelect = viewModel::setCompressTierVideo,
+                        descriptionRes = { it.videoDescRes },
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    EstimateLine(state.encoderCapabilities, VideoCompressionProfile(state.videoCodec, state.compressTierVideo))
                 }
             }
         }
@@ -2485,45 +2494,6 @@ fun ShareMetadataScreen(
                     checked = state.stripShareAuthorship,
                     onCheckedChange = viewModel::setStripShareAuthorship,
                     indented = true,
-                )
-            }
-        }
-    }
-}
-
-/** Single-choice row for the upload-compression tier picker. Mirrors the landing-tab radio row
- *  style (a filled check on the selected entry) but carries a one-line tradeoff description under
- *  the label, and sits indented under the "Compress uploads" toggle. */
-@Composable
-private fun CompressTierRow(
-    label: String,
-    description: String,
-    selected: Boolean,
-    onClick: () -> Unit,
-) {
-    val colors = AppColors.current
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onClick)
-            .padding(start = 32.dp, end = 16.dp, top = 13.dp, bottom = 13.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Column(modifier = Modifier.weight(1f)) {
-            Text(label, color = colors.fgPrimary, fontSize = 15.sp, fontWeight = FontWeight.Medium)
-            Text(description, color = colors.fgMute, fontSize = 12.5.sp)
-        }
-        Spacer(Modifier.width(12.dp))
-        if (selected) {
-            Box(
-                modifier = Modifier.size(20.dp).background(colors.accent, CircleShape),
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(
-                    Icons.Default.Check,
-                    null,
-                    tint = Color.White,
-                    modifier = Modifier.size(14.dp),
                 )
             }
         }

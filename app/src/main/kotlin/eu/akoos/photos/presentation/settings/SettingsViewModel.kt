@@ -95,13 +95,16 @@ import eu.akoos.photos.data.hidden.HiddenVaultLeftovers
 import eu.akoos.photos.data.hidden.HiddenVaultRecords
 import eu.akoos.photos.data.offline.OfflineStorageManager
 import eu.akoos.photos.data.preferences.AccountScopedPreferences
+import eu.akoos.photos.data.preferences.CompressionPreferences
 import eu.akoos.photos.data.preferences.SettingsKeys
 import eu.akoos.photos.data.preferences.settingsDataStore
 import eu.akoos.photos.data.preferences.syncEffectivelyEnabled
+import eu.akoos.photos.data.upload.compression.VideoEncoderCapabilities
 import eu.akoos.photos.presentation.lock.AppLockManager
 import eu.akoos.photos.service.ScreenshotOverlayService
 import eu.akoos.photos.domain.entity.SyncStatus
 import eu.akoos.photos.domain.entity.UploadCompressionTier
+import eu.akoos.photos.domain.entity.compression.VideoCodecChoice
 import kotlinx.coroutines.flow.combine
 import eu.akoos.photos.domain.repository.DrivePhotoRepository
 import eu.akoos.photos.domain.repository.LocalMediaRepository
@@ -182,6 +185,7 @@ class SettingsViewModel @Inject constructor(
     private val semanticIndexingScheduler: SemanticIndexingScheduler,
     private val modelDownloadState: ModelDownloadState,
     private val mlWalkGate: MlWalkGate,
+    private val videoEncoderCapabilities: VideoEncoderCapabilities,
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(SettingsUiState())
@@ -202,6 +206,11 @@ class SettingsViewModel @Inject constructor(
     private val semanticModelManager by lazy { SemanticModelManager(context) }
 
     init {
+        // The codec chips need this device's encoders: a one-off scan, cached for the process.
+        viewModelScope.launch(Dispatchers.Default) {
+            val caps = runCatching { videoEncoderCapabilities.snapshot() }.getOrNull()
+            _uiState.update { it.copy(encoderCapabilities = caps) }
+        }
         // The per-feature enable toggles mirror their durable prefs, so a download that finished on
         // ModelDownloadService (which sets the pref) flips the row on live on whichever settings page is
         // open, and because the pref is the source of truth a stale finished-state can never re-enable a
@@ -965,6 +974,7 @@ class SettingsViewModel @Inject constructor(
                     compressTierVideo = UploadCompressionTier.fromOrdinalOrDefault(
                         migratedPrefs[SettingsKeys.COMPRESS_UPLOAD_TIER_VIDEO] ?: UploadCompressionTier.BALANCED.ordinal
                     ),
+                    videoCodec = CompressionPreferences.videoCodec(migratedPrefs),
                     mirrorStripToLocal = migratedPrefs[SettingsKeys.MIRROR_STRIP_TO_LOCAL] ?: false,
                     mirrorCompressToLocal = migratedPrefs[SettingsKeys.MIRROR_COMPRESS_TO_LOCAL] ?: false,
                     renameToCaptureDate = migratedPrefs[SettingsKeys.RENAME_TO_CAPTURE_DATE] ?: false,
@@ -1894,6 +1904,13 @@ class SettingsViewModel @Inject constructor(
         viewModelScope.launch {
             context.settingsDataStore.edit { it[SettingsKeys.COMPRESS_UPLOAD_TIER_VIDEO] = tier.ordinal }
             _uiState.update { it.copy(compressTierVideo = tier) }
+        }
+    }
+
+    fun setVideoCodec(choice: VideoCodecChoice) {
+        viewModelScope.launch {
+            context.settingsDataStore.edit { it[SettingsKeys.COMPRESS_VIDEO_CODEC] = choice.key }
+            _uiState.update { it.copy(videoCodec = choice) }
         }
     }
 
