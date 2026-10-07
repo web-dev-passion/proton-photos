@@ -35,6 +35,7 @@ import android.util.Log
 import androidx.annotation.OptIn
 import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.effect.FrameDropEffect
 import androidx.media3.effect.Presentation
@@ -149,9 +150,13 @@ object VideoUploadCompressor {
             return Outcome(null, CompressionOutcome.SKIPPED, TranscodeAcceptance.reasonFor(verdict), outputMime, outputBytes)
         }
         // The capture date the upload uses can differ from the source container's creation time, which
-        // InAppMp4Muxer copies, so stamp it explicitly.
-        if (sourceDateEpochMs > 0L && stampCreationTime(produced, sourceDateEpochMs) == null) {
-            return Outcome(null, CompressionOutcome.FAILED, CompressionSkipReason.ENCODER_ERROR, outputMime, outputBytes, "TIMESTAMP")
+        // InAppMp4Muxer copies, so stamp it explicitly. Then read the file back: a muxer or stamp problem
+        // must never reach Drive.
+        if (sourceDateEpochMs > 0L) Mp4CreationTime.stamp(produced, sourceDateEpochMs)
+        if (!probeReadable(produced)) {
+            Log.w(TAG, "transcoded file does not read back; uploading original instead")
+            produced.delete()
+            return Outcome(null, CompressionOutcome.FAILED, CompressionSkipReason.ENCODER_ERROR, outputMime, outputBytes, "UNREADABLE")
         }
         val fellBack = plan.plannedFallback != null || VideoCodec.fromMime(outputMime) != plan.codec
         return Outcome(
@@ -255,6 +260,9 @@ object VideoUploadCompressor {
 
             val transformer = Transformer.Builder(context)
                 .setVideoMimeType(plan.codec.mimeType)
+                // AAC passes through; anything else (Opus, Vorbis, AMR) is converted. AAC plays in every
+                // MP4 player, and InAppMp4Muxer 1.8.0 writes an Opus header nothing can read back.
+                .setAudioMimeType(MimeTypes.AUDIO_AAC)
                 .setEncoderFactory(encoderFactory)
                 .setMuxerFactory(InAppMp4Muxer.Factory())
                 .apply { if (!plan.hardware) setMaxDelayBetweenMuxerSamplesMs(SOFTWARE_MUXER_WATCHDOG_MS) }
@@ -342,25 +350,13 @@ object VideoUploadCompressor {
         }, PROGRESS_POLL_MS)
     }
 
-    /**
-     * Best-effort: write [captureEpochMs] into the transcoded MP4's mvhd/tkhd/mdhd timestamps so the
-     * compressed FILE keeps the original capture date rather than the transcode time. The file is
-     * re-probed afterwards and, if it somehow no longer decodes, deleted so the caller falls back to
-     * the original. Returns the file to upload, or null.
-     */
-    private fun stampCreationTime(file: File, captureEpochMs: Long): File? {
-        Mp4CreationTime.stamp(file, captureEpochMs)
-        if (probeReadable(file)) return file
-        Log.w(TAG, "creation-time stamp left the file unreadable; uploading original instead")
-        file.delete()
-        return null
-    }
-
+    /** Whether the file reads back as a video with a duration. */
     private fun probeReadable(file: File): Boolean {
         val retriever = MediaMetadataRetriever()
         return try {
             retriever.setDataSource(file.absolutePath)
-            (retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L) > 0L
+            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_VIDEO) == "yes" &&
+                (retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L) > 0L
         } catch (t: Throwable) {
             false
         } finally {

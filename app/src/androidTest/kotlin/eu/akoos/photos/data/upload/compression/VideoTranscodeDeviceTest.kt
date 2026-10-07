@@ -61,7 +61,8 @@ import java.util.TimeZone
 /**
  * Real transcodes on a device or emulator. Needs synthetic clips pushed to
  * `Android/data/<package>/files/clips/` (ffmpeg `testsrc2`: 1080p30 H.264 at 16 Mbps, 1080p60, 480p,
- * 360p, a 720p clip at 1 Mbps, an HDR10 H.265 clip and a portrait clip with a 90° display matrix);
+ * 360p, a 720p clip at 1 Mbps, an HDR10 H.265 clip, a portrait clip with a 90° display matrix, and
+ * 720p clips in MOV, 3GP, WebM and MKV containers);
  * each test skips when its clip is missing.
  */
 @RunWith(AndroidJUnit4::class)
@@ -118,6 +119,16 @@ class VideoTranscodeDeviceTest {
         return file!!
     }
 
+    private fun trackMimes(file: File): List<String> {
+        val extractor = MediaExtractor()
+        return try {
+            extractor.setDataSource(file.absolutePath)
+            (0 until extractor.trackCount).mapNotNull { extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME) }
+        } finally {
+            extractor.release()
+        }
+    }
+
     private fun videoFormat(file: File): MediaFormat {
         val extractor = MediaExtractor()
         return try {
@@ -168,6 +179,21 @@ class VideoTranscodeDeviceTest {
             val file = run("360p_h264.mp4", VideoCompressionProfile(codec = VideoCodecChoice.AVC), forceCodec = codec).second.output()
             assertEquals(codec.mimeType, videoFormat(file).getString(MediaFormat.KEY_MIME))
             assertTrue("the $codec output decodes", decodesAFrame(file))
+        }
+    }
+
+    @Test
+    fun mov_3gp_webm_and_mkv_sources_come_out_as_mp4() {
+        val clips = listOf("container_mov.mov", "container_3gp.3gp", "container_webm.webm", "container_mkv.mkv")
+            .filter { File(context.getExternalFilesDir("clips"), it).exists() }
+        assumeTrue("container clips not pushed", clips.isNotEmpty())
+        for (name in clips) {
+            val file = run(name, VideoCompressionProfile(codec = VideoCodecChoice.AVC)).second.output()
+            val header = file.inputStream().use { input -> ByteArray(12).also { input.read(it) } }
+            assertEquals("$name: ISO base media file", "ftyp", String(header, 4, 4, Charsets.US_ASCII))
+            assertTrue("$name: not a QuickTime file", String(header, 8, 4, Charsets.US_ASCII) != "qt  ")
+            assertEquals(listOf("audio/mp4a-latm", "video/avc"), trackMimes(file).sorted())
+            assertTrue("$name decodes", decodesAFrame(file))
         }
     }
 
