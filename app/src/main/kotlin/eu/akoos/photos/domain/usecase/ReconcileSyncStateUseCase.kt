@@ -215,11 +215,13 @@ class ReconcileSyncStateUseCase @Inject constructor(
 
             // captureTime in CloudPhoto is Unix seconds; LocalMediaItem.dateTaken is ms.
             val localCaptureTimeSec = local.dateTaken / 1000L
-            // A compressed or strip-transcoded photo went up as JPEG (IMG.heic as IMG.jpg), so while
-            // either rewrite is on, look for that name too.
+            // A compressed or strip-transcoded photo went up as JPEG (IMG.heic as IMG.jpg), a compressed
+            // video as MP4 (clip.mov as clip.mp4), so while that rewrite is on, look for that name too.
+            val rewritesFormat =
+                if (local.mimeType.startsWith("video/")) compressVideosOnUpload else compressOnUpload || stripOnUpload
             val nameDateTwin = cloudByNameAndDate[local.displayName to localCaptureTimeSec]
                 ?: UploadFormatNaming.reencodedName(local.displayName, local.mimeType)
-                    ?.takeIf { compressOnUpload || stripOnUpload }
+                    ?.takeIf { rewritesFormat }
                     ?.let { cloudByNameAndDate[it to localCaptureTimeSec] }
             val nameCandidate = nameDateTwin
                 ?: cloudByNameSize[local.displayName to local.sizeBytes]?.takeIf { it.sizeBytes > 0 }

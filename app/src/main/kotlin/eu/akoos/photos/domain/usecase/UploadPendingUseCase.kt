@@ -786,9 +786,9 @@ class UploadPendingUseCase @Inject constructor(
         // A temp holding a timestamp-floored copy of an uncompressed video (Fix: backup video mvhd
         // floor). Tracked alongside the other temps so it is cleaned up on both success and failure.
         var tsFloorFile: File? = null
-        // JPEG when a re-encode (photo compression or the HEIC strip transcode) changed the format,
-        // so the upload's name and MIME type follow the bytes.
-        var producedImageMime: String? = null
+        // The format a re-encode wrote when it changed the file's format: JPEG from photo compression
+        // or the HEIC strip transcode, MP4 from a video transcode. The upload's name and type follow it.
+        var producedMime: String? = null
         try {
             val rawLocalItem = localRepo.queryByUri(state.localUri)
             if (rawLocalItem == null) {
@@ -1034,7 +1034,7 @@ class UploadPendingUseCase @Inject constructor(
                             .transcodeStrippedJpeg(context, state.localUri, stripConfig)
                         if (transcoded != null) {
                             strippedFile = transcoded
-                            producedImageMime = UploadImageCompressor.JPEG_MIME
+                            producedMime = UploadImageCompressor.JPEG_MIME
                             Log.d(UPLOAD_TAG, "Stripped JPEG transcoded for ${localItem.displayName} (unwritable container)")
                             android.net.Uri.fromFile(transcoded).toString()
                         } else {
@@ -1119,7 +1119,7 @@ class UploadPendingUseCase @Inject constructor(
                 val compressed = outcome.file
                 if (compressed != null) {
                     compressedFile = compressed
-                    producedImageMime = UploadImageCompressor.JPEG_MIME
+                    producedMime = UploadImageCompressor.JPEG_MIME
                     // The stripped temp (if any) is now superseded by the compressed copy, so delete
                     // it so a strip+compress pass doesn't leak the intermediate. The compressed file is
                     // the only temp we still need, tracked for cleanup in the finally below.
@@ -1172,6 +1172,7 @@ class UploadPendingUseCase @Inject constructor(
                 val compressed = attempt.file
                 if (compressed != null) {
                     compressedFile = compressed
+                    producedMime = UploadFormatNaming.MP4
                     strippedFile?.delete()
                     strippedFile = null
                     android.net.Uri.fromFile(compressed).toString()
@@ -1262,7 +1263,7 @@ class UploadPendingUseCase @Inject constructor(
                 localItem
             // After a re-encode the name and MIME type follow the bytes; the device file keeps its own.
             val (uploadName, uploadMime) = UploadFormatNaming.forProducedFormat(
-                sizedItem.displayName, sizedItem.mimeType, producedImageMime,
+                sizedItem.displayName, sizedItem.mimeType, producedMime,
             )
             val uploadItem = sizedItem.copy(displayName = uploadName, mimeType = uploadMime)
 
@@ -1393,7 +1394,11 @@ class UploadPendingUseCase @Inject constructor(
             // Safe to mirror when the local content matches that temp: strip mirrored (both stripped) or
             // strip-upload off (neither stripped).
             if (compressVideosOnUpload && mirrorCompressToLocal && localItem.mimeType.startsWith("video/")) {
-                if (mirrorStripToLocal || !stripOnUpload) {
+                if (!UploadFormatNaming.isMp4(localItem.mimeType)) {
+                    // The transcode always writes MP4, so a .mov, .3gp or .webm original would end up with
+                    // bytes that contradict its name and MediaStore type. Leave it untouched.
+                    Log.d(UPLOAD_TAG, "Mirror compress skipped for ${localItem.displayName}: ${localItem.mimeType} cannot hold an MP4")
+                } else if (mirrorStripToLocal || !stripOnUpload) {
                     compressedFile?.let { local ->
                         if (overwriteLocalInPlace(state.localUri, local)) {
                             Log.d(UPLOAD_TAG, "Mirror compress: on-device video compressed for ${localItem.displayName}")

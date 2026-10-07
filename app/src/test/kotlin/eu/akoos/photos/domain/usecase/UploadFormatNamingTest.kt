@@ -67,9 +67,26 @@ class UploadFormatNamingTest {
     }
 
     @Test
-    fun reconcile_looks_for_the_jpeg_name_of_non_jpeg_photos_only() {
+    fun a_transcoded_mov_3gp_webm_or_mkv_is_uploaded_as_an_mp4() {
+        assertEquals("IMG_0001.MP4" to "video/mp4", UploadFormatNaming.forProducedFormat("IMG_0001.MOV", "video/quicktime", "video/mp4"))
+        assertEquals("clip.mp4" to "video/mp4", UploadFormatNaming.forProducedFormat("clip.3gp", "video/3gpp", "video/mp4"))
+        assertEquals("rec.mp4" to "video/mp4", UploadFormatNaming.forProducedFormat("rec.webm", "video/webm", "video/mp4"))
+        assertEquals("a.mp4" to "video/mp4", UploadFormatNaming.forProducedFormat("a.mkv", "video/x-matroska", "video/mp4"))
+    }
+
+    @Test
+    fun an_mp4_staying_an_mp4_is_untouched() {
+        assertEquals("VID_1.mp4" to "video/mp4", UploadFormatNaming.forProducedFormat("VID_1.mp4", "video/mp4", "video/mp4"))
+        assertEquals(true, UploadFormatNaming.isMp4("video/mp4"))
+        assertEquals(false, UploadFormatNaming.isMp4("video/quicktime"))
+    }
+
+    @Test
+    fun reconcile_looks_for_the_reencoded_name_only_when_the_format_changes() {
         assertEquals("IMG_1.jpg", UploadFormatNaming.reencodedName("IMG_1.heic", "image/heic"))
         assertNull(UploadFormatNaming.reencodedName("IMG_1.jpg", "image/jpeg"))
+        assertEquals("VID_1.mp4", UploadFormatNaming.reencodedName("VID_1.mov", "video/quicktime"))
         assertNull(UploadFormatNaming.reencodedName("VID_1.mp4", "video/mp4"))
+        assertNull(UploadFormatNaming.reencodedName("notes.pdf", "application/pdf"))
     }
 }

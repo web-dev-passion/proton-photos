@@ -563,6 +563,32 @@ class UploadPendingUseCaseTest {
     }
 
     @Test
+    fun `a compressed mov uploads under an mp4 name and type that match its bytes`() = runTest {
+        every { mockPrefsRef[SettingsKeys.COMPRESS_VIDEO_ON_UPLOAD] } returns true
+        val mov = videoItem("uri://mov").copy(displayName = "IMG_0001.MOV", mimeType = "video/quicktime")
+        every { syncStateRepo.observeAll(userId) } returns flowOf(listOf(syncState("uri://mov", SyncStatus.LOCAL_ONLY)))
+        every { localRepo.observeLocalMedia() } returns flowOf(listOf(mov))
+        coEvery { localRepo.queryByUri("uri://mov") } returns mov
+        val sent = slot<LocalMediaItem>()
+        coEvery { cloudRepo.uploadFile(userId, capture(sent), any(), any(), any(), any()) } returns "cloud-id"
+        val temp = java.io.File.createTempFile("videocompress_", ".mp4").apply { writeBytes(ByteArray(10)) }
+        coEvery {
+            videoCompression.compress(any(), any(), any(), any(), any())
+        } returns VideoUploadCompression.Attempt(temp, CompressionOutcome.COMPRESSED, null, 10_000_000L, "video/avc", 10L)
+        mockkStatic(Uri::class)
+        every { Uri.fromFile(any()) } answers {
+            mockk<Uri> { every { this@mockk.toString() } returns "file://" + firstArg<java.io.File>().path }
+        }
+
+        useCase(userId)
+        io.mockk.unmockkStatic(Uri::class)
+
+        assertEquals("IMG_0001.MP4", sent.captured.displayName)
+        assertEquals("video/mp4", sent.captured.mimeType)
+        temp.delete()
+    }
+
+    @Test
     fun `video compression plans with the video tier, distinct from the photo tier`() = runTest {
         every { mockPrefsRef[SettingsKeys.COMPRESS_VIDEO_ON_UPLOAD] } returns true
         every { mockPrefsRef[SettingsKeys.COMPRESS_UPLOAD_TIER] } returns UploadCompressionTier.LIGHT.ordinal
