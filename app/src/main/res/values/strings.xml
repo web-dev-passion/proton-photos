@@ -1737,6 +1737,8 @@
     <string name="viewer_meta_row_file">File</string>
     <string name="viewer_meta_row_date">Date</string>
     <string name="viewer_meta_row_size">Size</string>
+    <string name="viewer_meta_row_size_device">Size on device</string>
+    <string name="viewer_meta_row_size_drive">Size in Proton Drive</string>
     <string name="viewer_meta_row_type">Type</string>
     <string name="viewer_meta_row_resolution">Resolution</string>
     <string name="viewer_meta_row_duration">Duration</string>
